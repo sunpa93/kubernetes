@@ -32,6 +32,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	bootstrapapi "k8s.io/cluster-bootstrap/token/api"
 	bootstraputil "k8s.io/cluster-bootstrap/token/util"
+	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
 	kubeadmapiv1beta2 "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1beta2"
 	kubeadmcmdoptions "k8s.io/kubernetes/cmd/kubeadm/app/cmd/options"
@@ -397,7 +398,13 @@ func ValidateIPNetFromString(subnetStr string, minAddrs int64, isDualStack bool,
 	for _, s := range subnets {
 		numAddresses := utilnet.RangeSize(s)
 		if numAddresses < minAddrs {
-			allErrs = append(allErrs, field.Invalid(fldPath, s.String(), "subnet is too small"))
+			allErrs = append(allErrs, field.Invalid(fldPath, s.String(), fmt.Sprintf("subnet with %d address(es) is too small, the minimum is %d", numAddresses, minAddrs)))
+		}
+
+		// Warn when the subnet is in site-local range - i.e. contains addresses that belong to fec0::/10
+		_, siteLocalNet, _ := net.ParseCIDR("fec0::/10")
+		if siteLocalNet.Contains(s.IP) || s.Contains(siteLocalNet.IP) {
+			klog.Warningf("the subnet %v contains IPv6 site-local addresses that belong to fec0::/10 which has been deprecated by rfc3879", s)
 		}
 	}
 	return allErrs
@@ -440,9 +447,9 @@ func ValidatePodSubnetNodeMask(subnetStr string, c *kubeadm.ClusterConfiguration
 		// the pod subnet mask needs to allow one or multiple node-masks
 		// i.e. if it has a /24 the node mask must be between 24 and 32 for ipv4
 		if maskSize > nodeMask {
-			allErrs = append(allErrs, field.Invalid(fldPath, podSubnet.String(), "pod subnet size is smaller than the node subnet size"))
+			allErrs = append(allErrs, field.Invalid(fldPath, podSubnet.String(), fmt.Sprintf("the size of pod subnet with mask %d is smaller than the size of node subnet with mask %d", maskSize, nodeMask)))
 		} else if (nodeMask - maskSize) > constants.PodSubnetNodeMaskMaxDiff {
-			allErrs = append(allErrs, field.Invalid(fldPath, podSubnet.String(), fmt.Sprintf("pod subnet mask and node-mask difference can not be greater than %d", constants.PodSubnetNodeMaskMaxDiff)))
+			allErrs = append(allErrs, field.Invalid(fldPath, podSubnet.String(), fmt.Sprintf("pod subnet mask (%d) and node-mask (%d) difference is greater than %d", maskSize, nodeMask, constants.PodSubnetNodeMaskMaxDiff)))
 		}
 	}
 	return allErrs
@@ -454,7 +461,7 @@ func ValidatePodSubnetNodeMask(subnetStr string, c *kubeadm.ClusterConfiguration
 func getClusterNodeMask(c *kubeadm.ClusterConfiguration, isIPv6 bool) (int, error) {
 	// defaultNodeMaskCIDRIPv4 is default mask size for IPv4 node cidr for use by the controller manager
 	const defaultNodeMaskCIDRIPv4 = 24
-	// DefaultNodeMaskCIDRIPv6 is default mask size for IPv6 node cidr for use by the controller manager
+	// defaultNodeMaskCIDRIPv6 is default mask size for IPv6 node cidr for use by the controller manager
 	const defaultNodeMaskCIDRIPv6 = 64
 	var maskSize int
 	var maskArg string
@@ -501,8 +508,10 @@ func ValidateNetworking(c *kubeadm.ClusterConfiguration, fldPath *field.Path) fi
 	}
 	if len(c.Networking.PodSubnet) != 0 {
 		allErrs = append(allErrs, ValidateIPNetFromString(c.Networking.PodSubnet, constants.MinimumAddressesInPodSubnet, isDualStack, field.NewPath("podSubnet"))...)
-		// Pod subnet was already validated, we need to validate now against the node-mask
-		allErrs = append(allErrs, ValidatePodSubnetNodeMask(c.Networking.PodSubnet, c, field.NewPath("podSubnet"))...)
+		if c.ControllerManager.ExtraArgs["allocate-node-cidrs"] != "false" {
+			// Pod subnet was already validated, we need to validate now against the node-mask
+			allErrs = append(allErrs, ValidatePodSubnetNodeMask(c.Networking.PodSubnet, c, field.NewPath("podSubnet"))...)
+		}
 	}
 	return allErrs
 }

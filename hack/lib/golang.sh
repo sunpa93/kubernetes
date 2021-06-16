@@ -248,6 +248,7 @@ kube::golang::setup_platforms
 # If you update this list, please also update build/BUILD.
 readonly KUBE_CLIENT_TARGETS=(
   cmd/kubectl
+  cmd/kubectl-convert
 )
 readonly KUBE_CLIENT_BINARIES=("${KUBE_CLIENT_TARGETS[@]##*/}")
 readonly KUBE_CLIENT_BINARIES_WIN=("${KUBE_CLIENT_BINARIES[@]/%/.exe}")
@@ -305,9 +306,10 @@ readonly KUBE_TEST_SERVER_BINARIES=("${KUBE_TEST_SERVER_TARGETS[@]##*/}")
 readonly KUBE_TEST_SERVER_PLATFORMS=("${KUBE_SERVER_PLATFORMS[@]:+"${KUBE_SERVER_PLATFORMS[@]}"}")
 
 # Gigabytes necessary for parallel platform builds.
-# As of January 2018, RAM usage is exceeding 30G
-# Setting to 40 to provide some headroom
-readonly KUBE_PARALLEL_BUILD_MEMORY=40
+# As of January 2018, RAM usage is exceeding 30G.
+# This variable can be overwritten at your own risk.
+# It's defaulting to 40G to provide some headroom
+readonly KUBE_PARALLEL_BUILD_MEMORY=${KUBE_PARALLEL_BUILD_MEMORY:-40}
 
 readonly KUBE_ALL_TARGETS=(
   "${KUBE_SERVER_TARGETS[@]}"
@@ -338,25 +340,25 @@ readonly KUBE_COVERAGE_INSTRUMENTED_PACKAGES=(
 # KUBE_CGO_OVERRIDES is a space-separated list of binaries which should be built
 # with CGO enabled, assuming CGO is supported on the target platform.
 # This overrides any entry in KUBE_STATIC_LIBRARIES.
-IFS=" " read -ra KUBE_CGO_OVERRIDES <<< "${KUBE_CGO_OVERRIDES:-}"
-readonly KUBE_CGO_OVERRIDES
+IFS=" " read -ra KUBE_CGO_OVERRIDES_LIST <<< "${KUBE_CGO_OVERRIDES:-}"
+readonly KUBE_CGO_OVERRIDES_LIST
 # KUBE_STATIC_OVERRIDES is a space-separated list of binaries which should be
 # built with CGO disabled. This is in addition to the list in
 # KUBE_STATIC_LIBRARIES.
-IFS=" " read -ra KUBE_STATIC_OVERRIDES <<< "${KUBE_STATIC_OVERRIDES:-}"
-readonly KUBE_STATIC_OVERRIDES
+IFS=" " read -ra KUBE_STATIC_OVERRIDES_LIST <<< "${KUBE_STATIC_OVERRIDES:-}"
+readonly KUBE_STATIC_OVERRIDES_LIST
 
 kube::golang::is_statically_linked_library() {
   local e
   # Explicitly enable cgo when building kubectl for darwin from darwin.
   [[ "$(go env GOHOSTOS)" == "darwin" && "$(go env GOOS)" == "darwin" &&
     "$1" == *"/kubectl" ]] && return 1
-  if [[ -n "${KUBE_CGO_OVERRIDES:+x}" ]]; then
-    for e in "${KUBE_CGO_OVERRIDES[@]}"; do [[ "${1}" == *"/${e}" ]] && return 1; done;
+  if [[ -n "${KUBE_CGO_OVERRIDES_LIST:+x}" ]]; then
+    for e in "${KUBE_CGO_OVERRIDES_LIST[@]}"; do [[ "${1}" == *"/${e}" ]] && return 1; done;
   fi
   for e in "${KUBE_STATIC_LIBRARIES[@]}"; do [[ "${1}" == *"/${e}" ]] && return 0; done;
-  if [[ -n "${KUBE_STATIC_OVERRIDES:+x}" ]]; then
-    for e in "${KUBE_STATIC_OVERRIDES[@]}"; do [[ "${1}" == *"/${e}" ]] && return 0; done;
+  if [[ -n "${KUBE_STATIC_OVERRIDES_LIST:+x}" ]]; then
+    for e in "${KUBE_STATIC_OVERRIDES_LIST[@]}"; do [[ "${1}" == *"/${e}" ]] && return 0; done;
   fi
   return 1;
 }
@@ -393,11 +395,15 @@ kube::golang::set_platform_envs() {
   export GOOS=${platform%/*}
   export GOARCH=${platform##*/}
 
-  # Do not set CC when building natively on a platform, only if cross-compiling from linux/amd64
-  if [[ $(kube::golang::host_platform) == "linux/amd64" ]]; then
-    # Dynamic CGO linking for other server architectures than linux/amd64 goes here
+  # Do not set CC when building natively on a platform, only if cross-compiling
+  if [[ $(kube::golang::host_platform) != "$platform" ]]; then
+    # Dynamic CGO linking for other server architectures than host architecture goes here
     # If you want to include support for more server platforms than these, add arch-specific gcc names here
     case "${platform}" in
+      "linux/amd64")
+        export CGO_ENABLED=1
+        export CC=${KUBE_LINUX_AMD64_CC:-x86_64-linux-gnu-gcc}
+        ;;
       "linux/arm")
         export CGO_ENABLED=1
         export CC=${KUBE_LINUX_ARM_CC:-arm-linux-gnueabihf-gcc}
@@ -415,6 +421,13 @@ kube::golang::set_platform_envs() {
         export CC=${KUBE_LINUX_S390X_CC:-s390x-linux-gnu-gcc}
         ;;
     esac
+  fi
+
+  # if CC is defined for platform then always enable it
+  ccenv=$(echo "$platform" | awk -F/ '{print "KUBE_" toupper($1) "_" toupper($2) "_CC"}')
+  if [ -n "${!ccenv-}" ]; then 
+    export CGO_ENABLED=1
+    export CC="${!ccenv}"
   fi
 }
 

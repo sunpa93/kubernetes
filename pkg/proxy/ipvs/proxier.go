@@ -106,6 +106,7 @@ var iptablesJumpChain = []struct {
 	{utiliptables.TableNAT, utiliptables.ChainPrerouting, kubeServicesChain, "kubernetes service portals"},
 	{utiliptables.TableNAT, utiliptables.ChainPostrouting, kubePostroutingChain, "kubernetes postrouting rules"},
 	{utiliptables.TableFilter, utiliptables.ChainForward, KubeForwardChain, "kubernetes forwarding rules"},
+	{utiliptables.TableFilter, utiliptables.ChainInput, KubeNodePortChain, "kubernetes health check rules"},
 }
 
 var iptablesChains = []struct {
@@ -119,6 +120,7 @@ var iptablesChains = []struct {
 	{utiliptables.TableNAT, KubeLoadBalancerChain},
 	{utiliptables.TableNAT, KubeMarkMasqChain},
 	{utiliptables.TableFilter, KubeForwardChain},
+	{utiliptables.TableFilter, KubeNodePortChain},
 }
 
 var iptablesEnsureChains = []struct {
@@ -161,6 +163,7 @@ var ipsetInfo = []struct {
 	{kubeNodePortLocalSetUDP, utilipset.BitmapPort, kubeNodePortLocalSetUDPComment},
 	{kubeNodePortSetSCTP, utilipset.HashIPPort, kubeNodePortSetSCTPComment},
 	{kubeNodePortLocalSetSCTP, utilipset.HashIPPort, kubeNodePortLocalSetSCTPComment},
+	{kubeHealthCheckNodePortSet, utilipset.BitmapPort, kubeHealthCheckNodePortSetComment},
 }
 
 // ipsetWithIptablesChain is the ipsets list with iptables source chain and the chain jump to
@@ -181,23 +184,25 @@ var ipsetWithIptablesChain = []struct {
 	{kubeLoadBalancerSourceCIDRSet, string(KubeFireWallChain), "RETURN", "dst,dst,src", ""},
 	{kubeLoadBalancerSourceIPSet, string(KubeFireWallChain), "RETURN", "dst,dst,src", ""},
 	{kubeLoadBalancerLocalSet, string(KubeLoadBalancerChain), "RETURN", "dst,dst", ""},
-	{kubeNodePortLocalSetTCP, string(KubeNodePortChain), "RETURN", "dst", "tcp"},
-	{kubeNodePortSetTCP, string(KubeNodePortChain), string(KubeMarkMasqChain), "dst", "tcp"},
-	{kubeNodePortLocalSetUDP, string(KubeNodePortChain), "RETURN", "dst", "udp"},
-	{kubeNodePortSetUDP, string(KubeNodePortChain), string(KubeMarkMasqChain), "dst", "udp"},
-	{kubeNodePortSetSCTP, string(KubeNodePortChain), string(KubeMarkMasqChain), "dst,dst", "sctp"},
-	{kubeNodePortLocalSetSCTP, string(KubeNodePortChain), "RETURN", "dst,dst", "sctp"},
+	{kubeNodePortLocalSetTCP, string(KubeNodePortChain), "RETURN", "dst", utilipset.ProtocolTCP},
+	{kubeNodePortSetTCP, string(KubeNodePortChain), string(KubeMarkMasqChain), "dst", utilipset.ProtocolTCP},
+	{kubeNodePortLocalSetUDP, string(KubeNodePortChain), "RETURN", "dst", utilipset.ProtocolUDP},
+	{kubeNodePortSetUDP, string(KubeNodePortChain), string(KubeMarkMasqChain), "dst", utilipset.ProtocolUDP},
+	{kubeNodePortSetSCTP, string(KubeNodePortChain), string(KubeMarkMasqChain), "dst,dst", utilipset.ProtocolSCTP},
+	{kubeNodePortLocalSetSCTP, string(KubeNodePortChain), "RETURN", "dst,dst", utilipset.ProtocolSCTP},
 }
 
 // In IPVS proxy mode, the following flags need to be set
-const sysctlBridgeCallIPTables = "net/bridge/bridge-nf-call-iptables"
-const sysctlVSConnTrack = "net/ipv4/vs/conntrack"
-const sysctlConnReuse = "net/ipv4/vs/conn_reuse_mode"
-const sysctlExpireNoDestConn = "net/ipv4/vs/expire_nodest_conn"
-const sysctlExpireQuiescentTemplate = "net/ipv4/vs/expire_quiescent_template"
-const sysctlForward = "net/ipv4/ip_forward"
-const sysctlArpIgnore = "net/ipv4/conf/all/arp_ignore"
-const sysctlArpAnnounce = "net/ipv4/conf/all/arp_announce"
+const (
+	sysctlBridgeCallIPTables      = "net/bridge/bridge-nf-call-iptables"
+	sysctlVSConnTrack             = "net/ipv4/vs/conntrack"
+	sysctlConnReuse               = "net/ipv4/vs/conn_reuse_mode"
+	sysctlExpireNoDestConn        = "net/ipv4/vs/expire_nodest_conn"
+	sysctlExpireQuiescentTemplate = "net/ipv4/vs/expire_quiescent_template"
+	sysctlForward                 = "net/ipv4/ip_forward"
+	sysctlArpIgnore               = "net/ipv4/conf/all/arp_ignore"
+	sysctlArpAnnounce             = "net/ipv4/conf/all/arp_announce"
+)
 
 // Proxier is an ipvs based proxy for connections between a localhost:lport
 // and services that provide the actual backends.
@@ -214,7 +219,7 @@ type Proxier struct {
 	mu           sync.Mutex // protects the following fields
 	serviceMap   proxy.ServiceMap
 	endpointsMap proxy.EndpointsMap
-	portsMap     map[utilproxy.LocalPort]utilproxy.Closeable
+	portsMap     map[utilnet.LocalPort]utilnet.Closeable
 	nodeLabels   map[string]string
 	// endpointsSynced, endpointSlicesSynced, and servicesSynced are set to true when
 	// corresponding objects are synced after startup. This is used to avoid updating
@@ -241,7 +246,7 @@ type Proxier struct {
 	localDetector  proxyutiliptables.LocalTrafficDetector
 	hostname       string
 	nodeIP         net.IP
-	portMapper     utilproxy.PortOpener
+	portMapper     utilnet.PortOpener
 	recorder       record.EventRecorder
 
 	serviceHealthServer healthcheck.ServiceHealthServer
@@ -454,7 +459,7 @@ func NewProxier(ipt utiliptables.Interface,
 
 	proxier := &Proxier{
 		ipFamily:              ipFamily,
-		portsMap:              make(map[utilproxy.LocalPort]utilproxy.Closeable),
+		portsMap:              make(map[utilnet.LocalPort]utilnet.Closeable),
 		serviceMap:            make(proxy.ServiceMap),
 		serviceChanges:        proxy.NewServiceChangeTracker(newServiceInfo, ipFamily, recorder, nil),
 		endpointsMap:          make(proxy.EndpointsMap),
@@ -469,7 +474,7 @@ func NewProxier(ipt utiliptables.Interface,
 		localDetector:         localDetector,
 		hostname:              hostname,
 		nodeIP:                nodeIP,
-		portMapper:            &listenPortOpener{},
+		portMapper:            &utilnet.ListenPortOpener,
 		recorder:              recorder,
 		serviceHealthServer:   serviceHealthServer,
 		healthzServer:         healthzServer,
@@ -1037,16 +1042,6 @@ func (proxier *Proxier) syncProxyRules() {
 		klog.V(4).Infof("syncProxyRules took %v", time.Since(start))
 	}()
 
-	localAddrs, err := utilproxy.GetLocalAddrs()
-	if err != nil {
-		klog.Errorf("Failed to get local addresses during proxy sync: %v, assuming external IPs are not local", err)
-	} else if len(localAddrs) == 0 {
-		klog.Warning("No local addresses found, assuming all external IPs are not local")
-	}
-
-	localAddrSet := utilnet.IPSet{}
-	localAddrSet.Insert(localAddrs...)
-
 	// We assume that if this was called, we really want to sync them,
 	// even if nothing changed in the meantime. In other words, callers are
 	// responsible for detecting no-op changes and not calling this function.
@@ -1083,7 +1078,7 @@ func (proxier *Proxier) syncProxyRules() {
 	proxier.createAndLinkKubeChain()
 
 	// make sure dummy interface exists in the system where ipvs Proxier will bind service address on it
-	_, err = proxier.netlinkHandle.EnsureDummyDevice(DefaultDummyDevice)
+	_, err := proxier.netlinkHandle.EnsureDummyDevice(DefaultDummyDevice)
 	if err != nil {
 		klog.Errorf("Failed to create dummy interface: %s, error: %v", DefaultDummyDevice, err)
 		return
@@ -1098,7 +1093,7 @@ func (proxier *Proxier) syncProxyRules() {
 	}
 
 	// Accumulate the set of local ports that we will be holding open once this update is complete
-	replacementPortsMap := map[utilproxy.LocalPort]utilproxy.Closeable{}
+	replacementPortsMap := map[utilnet.LocalPort]utilnet.Closeable{}
 	// activeIPVSServices represents IPVS service successfully created in this round of sync
 	activeIPVSServices := map[string]bool{}
 	// currentIPVSServices represent IPVS services listed from the system
@@ -1159,6 +1154,8 @@ func (proxier *Proxier) syncProxyRules() {
 	// reset slice to filtered entries
 	nodeIPs = nodeIPs[:idx]
 
+	localAddrSet := utilproxy.GetLocalAddrSet()
+
 	// Build IPVS rules for each service.
 	for svcName, svc := range proxier.serviceMap {
 		svcInfo, ok := svc.(*serviceInfo)
@@ -1167,6 +1164,10 @@ func (proxier *Proxier) syncProxyRules() {
 			continue
 		}
 		isIPv6 := utilnet.IsIPv6(svcInfo.ClusterIP())
+		localPortIPFamily := utilnet.IPv4
+		if isIPv6 {
+			localPortIPFamily = utilnet.IPv6
+		}
 		protocol := strings.ToLower(string(svcInfo.Protocol()))
 		// Precompute svcNameString; with many services the many calls
 		// to ServicePortName.String() show up in CPU profiles.
@@ -1249,17 +1250,18 @@ func (proxier *Proxier) syncProxyRules() {
 			// (because the socket might open but it would never work).
 			if (svcInfo.Protocol() != v1.ProtocolSCTP) && localAddrSet.Has(net.ParseIP(externalIP)) {
 				// We do not start listening on SCTP ports, according to our agreement in the SCTP support KEP
-				lp := utilproxy.LocalPort{
+				lp := utilnet.LocalPort{
 					Description: "externalIP for " + svcNameString,
 					IP:          externalIP,
+					IPFamily:    localPortIPFamily,
 					Port:        svcInfo.Port(),
-					Protocol:    protocol,
+					Protocol:    utilnet.Protocol(svcInfo.Protocol()),
 				}
 				if proxier.portsMap[lp] != nil {
 					klog.V(4).Infof("Port %s was open before and is still needed", lp.String())
 					replacementPortsMap[lp] = proxier.portsMap[lp]
 				} else {
-					socket, err := proxier.portMapper.OpenLocalPort(&lp, isIPv6)
+					socket, err := proxier.portMapper.OpenLocalPort(&lp)
 					if err != nil {
 						msg := fmt.Sprintf("can't open %s, skipping this externalIP: %v", lp.String(), err)
 
@@ -1273,6 +1275,7 @@ func (proxier *Proxier) syncProxyRules() {
 						klog.Error(msg)
 						continue
 					}
+					klog.V(2).Infof("Opened local port %s", lp.String())
 					replacementPortsMap[lp] = socket
 				}
 			} // We're holding the port, so it's OK to install IPVS rules.
@@ -1433,13 +1436,14 @@ func (proxier *Proxier) syncProxyRules() {
 				continue
 			}
 
-			var lps []utilproxy.LocalPort
+			var lps []utilnet.LocalPort
 			for _, address := range nodeAddresses {
-				lp := utilproxy.LocalPort{
+				lp := utilnet.LocalPort{
 					Description: "nodePort for " + svcNameString,
 					IP:          address,
+					IPFamily:    localPortIPFamily,
 					Port:        svcInfo.NodePort(),
-					Protocol:    protocol,
+					Protocol:    utilnet.Protocol(svcInfo.Protocol()),
 				}
 				if utilproxy.IsZeroCIDR(address) {
 					// Empty IP address means all
@@ -1459,12 +1463,14 @@ func (proxier *Proxier) syncProxyRules() {
 					// We do not start listening on SCTP ports, according to our agreement in the
 					// SCTP support KEP
 				} else if svcInfo.Protocol() != v1.ProtocolSCTP {
-					socket, err := proxier.portMapper.OpenLocalPort(&lp, isIPv6)
+					socket, err := proxier.portMapper.OpenLocalPort(&lp)
 					if err != nil {
 						klog.Errorf("can't open %s, skipping this nodePort: %v", lp.String(), err)
 						continue
 					}
-					if lp.Protocol == "udp" {
+					klog.V(2).Infof("Opened local port %s", lp.String())
+
+					if lp.Protocol == utilnet.UDP {
 						conntrack.ClearEntriesForPort(proxier.exec, lp.Port, isIPv6, v1.ProtocolUDP)
 					}
 					replacementPortsMap[lp] = socket
@@ -1480,7 +1486,7 @@ func (proxier *Proxier) syncProxyRules() {
 			)
 
 			switch protocol {
-			case "tcp":
+			case utilipset.ProtocolTCP:
 				nodePortSet = proxier.ipsetList[kubeNodePortSetTCP]
 				entries = []*utilipset.Entry{{
 					// No need to provide ip info
@@ -1488,7 +1494,7 @@ func (proxier *Proxier) syncProxyRules() {
 					Protocol: protocol,
 					SetType:  utilipset.BitmapPort,
 				}}
-			case "udp":
+			case utilipset.ProtocolUDP:
 				nodePortSet = proxier.ipsetList[kubeNodePortSetUDP]
 				entries = []*utilipset.Entry{{
 					// No need to provide ip info
@@ -1496,7 +1502,7 @@ func (proxier *Proxier) syncProxyRules() {
 					Protocol: protocol,
 					SetType:  utilipset.BitmapPort,
 				}}
-			case "sctp":
+			case utilipset.ProtocolSCTP:
 				nodePortSet = proxier.ipsetList[kubeNodePortSetSCTP]
 				// Since hash ip:port is used for SCTP, all the nodeIPs to be used in the SCTP ipset entries.
 				entries = []*utilipset.Entry{}
@@ -1531,11 +1537,11 @@ func (proxier *Proxier) syncProxyRules() {
 			if svcInfo.OnlyNodeLocalEndpoints() {
 				var nodePortLocalSet *IPSet
 				switch protocol {
-				case "tcp":
+				case utilipset.ProtocolTCP:
 					nodePortLocalSet = proxier.ipsetList[kubeNodePortLocalSetTCP]
-				case "udp":
+				case utilipset.ProtocolUDP:
 					nodePortLocalSet = proxier.ipsetList[kubeNodePortLocalSetUDP]
-				case "sctp":
+				case utilipset.ProtocolSCTP:
 					nodePortLocalSet = proxier.ipsetList[kubeNodePortLocalSetSCTP]
 				default:
 					// It should never hit
@@ -1580,6 +1586,22 @@ func (proxier *Proxier) syncProxyRules() {
 					klog.Errorf("Failed to sync service: %v, err: %v", serv, err)
 				}
 			}
+		}
+
+		if svcInfo.HealthCheckNodePort() != 0 {
+			nodePortSet := proxier.ipsetList[kubeHealthCheckNodePortSet]
+			entry := &utilipset.Entry{
+				// No need to provide ip info
+				Port:     svcInfo.HealthCheckNodePort(),
+				Protocol: "tcp",
+				SetType:  utilipset.BitmapPort,
+			}
+
+			if valid := nodePortSet.validateEntry(entry); !valid {
+				klog.Errorf("%s", fmt.Sprintf(EntryInvalidErr, entry, nodePortSet.Name))
+				continue
+			}
+			nodePortSet.activeEntries.Insert(entry.String())
 		}
 	}
 
@@ -1814,6 +1836,14 @@ func (proxier *Proxier) writeIptablesRules() {
 		"-m", "comment", "--comment", `"kubernetes forwarding conntrack pod destination rule"`,
 		"-m", "conntrack",
 		"--ctstate", "RELATED,ESTABLISHED",
+		"-j", "ACCEPT",
+	)
+
+	// Add rule to accept traffic towards health check node port
+	utilproxy.WriteLine(proxier.filterRules,
+		"-A", string(KubeNodePortChain),
+		"-m", "comment", "--comment", proxier.ipsetList[kubeHealthCheckNodePortSet].getComment(),
+		"-m", "set", "--match-set", proxier.ipsetList[kubeHealthCheckNodePortSet].Name, "dst",
 		"-j", "ACCEPT",
 	)
 
@@ -2171,60 +2201,6 @@ func (proxier *Proxier) getLegacyBindAddr(activeBindAddrs map[string]bool, curre
 		}
 	}
 	return legacyAddrs
-}
-
-// listenPortOpener opens ports by calling bind() and listen().
-type listenPortOpener struct{}
-
-// OpenLocalPort holds the given local port open.
-func (l *listenPortOpener) OpenLocalPort(lp *utilproxy.LocalPort, isIPv6 bool) (utilproxy.Closeable, error) {
-	return openLocalPort(lp, isIPv6)
-}
-
-func openLocalPort(lp *utilproxy.LocalPort, isIPv6 bool) (utilproxy.Closeable, error) {
-	// For ports on node IPs, open the actual port and hold it, even though we
-	// use ipvs to redirect traffic.
-	// This ensures a) that it's safe to use that port and b) that (a) stays
-	// true.  The risk is that some process on the node (e.g. sshd or kubelet)
-	// is using a port and we give that same port out to a Service.  That would
-	// be bad because ipvs would silently claim the traffic but the process
-	// would never know.
-	// NOTE: We should not need to have a real listen()ing socket - bind()
-	// should be enough, but I can't figure out a way to e2e test without
-	// it.  Tools like 'ss' and 'netstat' do not show sockets that are
-	// bind()ed but not listen()ed, and at least the default debian netcat
-	// has no way to avoid about 10 seconds of retries.
-	var socket utilproxy.Closeable
-	switch lp.Protocol {
-	case "tcp":
-		network := "tcp4"
-		if isIPv6 {
-			network = "tcp6"
-		}
-		listener, err := net.Listen(network, net.JoinHostPort(lp.IP, strconv.Itoa(lp.Port)))
-		if err != nil {
-			return nil, err
-		}
-		socket = listener
-	case "udp":
-		network := "udp4"
-		if isIPv6 {
-			network = "udp6"
-		}
-		addr, err := net.ResolveUDPAddr(network, net.JoinHostPort(lp.IP, strconv.Itoa(lp.Port)))
-		if err != nil {
-			return nil, err
-		}
-		conn, err := net.ListenUDP(network, addr)
-		if err != nil {
-			return nil, err
-		}
-		socket = conn
-	default:
-		return nil, fmt.Errorf("unknown protocol %q", lp.Protocol)
-	}
-	klog.V(2).Infof("Opened local port %s", lp.String())
-	return socket, nil
 }
 
 // ipvs Proxier fall back on iptables when it needs to do SNAT for engress packets

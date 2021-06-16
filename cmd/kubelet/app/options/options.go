@@ -31,10 +31,10 @@ import (
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	cliflag "k8s.io/component-base/cli/flag"
 	"k8s.io/kubelet/config/v1beta1"
+	kubeletapis "k8s.io/kubelet/pkg/apis"
 	"k8s.io/kubernetes/pkg/apis/core"
 	"k8s.io/kubernetes/pkg/cluster/ports"
 	"k8s.io/kubernetes/pkg/features"
-	kubeletapis "k8s.io/kubernetes/pkg/kubelet/apis"
 	kubeletconfig "k8s.io/kubernetes/pkg/kubelet/apis/config"
 	kubeletscheme "k8s.io/kubernetes/pkg/kubelet/apis/config/scheme"
 	kubeletconfigvalidation "k8s.io/kubernetes/pkg/kubelet/apis/config/validation"
@@ -167,8 +167,6 @@ type KubeletFlags struct {
 	// This flag, if set, instructs the kubelet to keep volumes from terminated pods mounted to the node.
 	// This can be useful for debugging volume related issues.
 	KeepTerminatedPodVolumes bool
-	// EnableCAdvisorJSONEndpoints enables some cAdvisor endpoints that will be removed in future versions
-	EnableCAdvisorJSONEndpoints bool
 }
 
 // NewKubeletFlags will create a new KubeletFlags with default values
@@ -194,8 +192,6 @@ func NewKubeletFlags() *KubeletFlags {
 		NodeLabels:              make(map[string]string),
 		RegisterNode:            true,
 		SeccompProfileRoot:      filepath.Join(defaultRootDir, "seccomp"),
-		// prior to the introduction of this flag, there was a hardcoded cap of 50 images
-		EnableCAdvisorJSONEndpoints: false,
 	}
 }
 
@@ -369,9 +365,6 @@ func (f *KubeletFlags) AddFlags(mainfs *pflag.FlagSet) {
 	fs.MarkDeprecated("non-masquerade-cidr", "will be removed in a future version")
 	fs.BoolVar(&f.KeepTerminatedPodVolumes, "keep-terminated-pod-volumes", f.KeepTerminatedPodVolumes, "Keep terminated pod volumes mounted to the node after the pod terminates.  Can be useful for debugging volume related issues.")
 	fs.MarkDeprecated("keep-terminated-pod-volumes", "will be removed in a future version")
-	fs.BoolVar(&f.EnableCAdvisorJSONEndpoints, "enable-cadvisor-json-endpoints", f.EnableCAdvisorJSONEndpoints, "Enable cAdvisor json /spec and /stats/* endpoints. This flag has no effect on the /stats/summary endpoint.  [default=false]")
-	// TODO: Remove this flag in 1.20+.  https://github.com/kubernetes/kubernetes/issues/68522
-	fs.MarkDeprecated("enable-cadvisor-json-endpoints", "will be removed in a future version")
 	fs.BoolVar(&f.ReallyCrashForTesting, "really-crash-for-testing", f.ReallyCrashForTesting, "If true, when panics occur crash. Intended for testing.")
 	fs.MarkDeprecated("really-crash-for-testing", "will be removed in a future version.")
 	fs.Float64Var(&f.ChaosChance, "chaos-chance", f.ChaosChance, "If > 0.0, introduce random client errors and latency. Intended for testing.")
@@ -550,4 +543,9 @@ Runtime log sanitization may introduce significant computation overhead and ther
 
 	// Graduated experimental flags, kept for backward compatibility
 	fs.BoolVar(&c.KernelMemcgNotification, "experimental-kernel-memcg-notification", c.KernelMemcgNotification, "Use kernelMemcgNotification configuration, this flag will be removed in 1.23.")
+
+	// Memory Manager Flags
+	fs.StringVar(&c.MemoryManagerPolicy, "memory-manager-policy", c.MemoryManagerPolicy, "Memory Manager policy to use. Possible values: 'None', 'Static'. Default: 'None'")
+	// TODO: once documentation link is available, replace KEP link with the documentation one.
+	fs.Var(&utilflag.ReservedMemoryVar{Value: &c.ReservedMemory}, "reserved-memory", "A comma separated list of memory reservations for NUMA nodes. (e.g. --reserved-memory 0:memory=1Gi,hugepages-1M=2Gi --reserved-memory 1:memory=2Gi). The total sum for each memory type should be equal to the sum of kube-reserved, system-reserved and eviction-threshold. See more details under https://github.com/kubernetes/enhancements/tree/master/keps/sig-node/1769-memory-manager#reserved-memory-flag")
 }

@@ -36,13 +36,14 @@ const (
 	etcHostsOriginalPath       = "/etc/hosts-original"
 )
 
+// KubeletManagedHostConfig defines the types for running managed etc hosts test cases
 type KubeletManagedHostConfig struct {
 	hostNetworkPod *v1.Pod
 	pod            *v1.Pod
 	f              *framework.Framework
 }
 
-var _ = framework.KubeDescribe("KubeletManagedEtcHosts", func() {
+var _ = SIGNodeDescribe("KubeletManagedEtcHosts", func() {
 	f := framework.NewDefaultFramework("e2e-kubelet-etc-hosts")
 	config := &KubeletManagedHostConfig{
 		f: f,

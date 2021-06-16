@@ -687,6 +687,7 @@ func run(ctx context.Context, s *options.KubeletServer, kubeDeps *kubelet.Depend
 			s.SystemReserved["cpu"] = strconv.Itoa(reservedSystemCPUs.Size())
 			klog.Infof("After cpu setting is overwritten, KubeReserved=\"%v\", SystemReserved=\"%v\"", s.KubeReserved, s.SystemReserved)
 		}
+
 		kubeReserved, err := parseResourceList(s.KubeReserved)
 		if err != nil {
 			return err
@@ -732,14 +733,16 @@ func run(ctx context.Context, s *options.KubeletServer, kubeDeps *kubelet.Depend
 					ReservedSystemCPUs:       reservedSystemCPUs,
 					HardEvictionThresholds:   hardEvictionThresholds,
 				},
-				QOSReserved:                           *experimentalQOSReserved,
-				ExperimentalCPUManagerPolicy:          s.CPUManagerPolicy,
-				ExperimentalCPUManagerReconcilePeriod: s.CPUManagerReconcilePeriod.Duration,
-				ExperimentalPodPidsLimit:              s.PodPidsLimit,
-				EnforceCPULimits:                      s.CPUCFSQuota,
-				CPUCFSQuotaPeriod:                     s.CPUCFSQuotaPeriod.Duration,
-				ExperimentalTopologyManagerPolicy:     s.TopologyManagerPolicy,
-				ExperimentalTopologyManagerScope:      s.TopologyManagerScope,
+				QOSReserved:                             *experimentalQOSReserved,
+				ExperimentalCPUManagerPolicy:            s.CPUManagerPolicy,
+				ExperimentalCPUManagerReconcilePeriod:   s.CPUManagerReconcilePeriod.Duration,
+				ExperimentalMemoryManagerPolicy:         s.MemoryManagerPolicy,
+				ExperimentalMemoryManagerReservedMemory: s.ReservedMemory,
+				ExperimentalPodPidsLimit:                s.PodPidsLimit,
+				EnforceCPULimits:                        s.CPUCFSQuota,
+				CPUCFSQuotaPeriod:                       s.CPUCFSQuotaPeriod.Duration,
+				ExperimentalTopologyManagerPolicy:       s.TopologyManagerPolicy,
+				ExperimentalTopologyManagerScope:        s.TopologyManagerScope,
 			},
 			s.FailSwapOn,
 			devicePluginEnabled,
@@ -1172,24 +1175,22 @@ func RunKubelet(kubeServer *options.KubeletServer, kubeDeps *kubelet.Dependencie
 		}
 		klog.Info("Started kubelet as runonce")
 	} else {
-		startKubelet(k, podCfg, &kubeServer.KubeletConfiguration, kubeDeps, kubeServer.EnableCAdvisorJSONEndpoints, kubeServer.EnableServer)
+		startKubelet(k, podCfg, &kubeServer.KubeletConfiguration, kubeDeps, kubeServer.EnableServer)
 		klog.Info("Started kubelet")
 	}
 	return nil
 }
 
-func startKubelet(k kubelet.Bootstrap, podCfg *config.PodConfig, kubeCfg *kubeletconfiginternal.KubeletConfiguration, kubeDeps *kubelet.Dependencies, enableCAdvisorJSONEndpoints, enableServer bool) {
+func startKubelet(k kubelet.Bootstrap, podCfg *config.PodConfig, kubeCfg *kubeletconfiginternal.KubeletConfiguration, kubeDeps *kubelet.Dependencies, enableServer bool) {
 	// start the kubelet
 	go k.Run(podCfg.Updates())
 
 	// start the kubelet server
 	if enableServer {
-		go k.ListenAndServe(net.ParseIP(kubeCfg.Address), uint(kubeCfg.Port), kubeDeps.TLSOptions, kubeDeps.Auth,
-			enableCAdvisorJSONEndpoints, kubeCfg.EnableDebuggingHandlers, kubeCfg.EnableContentionProfiling, kubeCfg.EnableSystemLogHandler)
-
+		go k.ListenAndServe(kubeCfg, kubeDeps.TLSOptions, kubeDeps.Auth)
 	}
 	if kubeCfg.ReadOnlyPort > 0 {
-		go k.ListenAndServeReadOnly(net.ParseIP(kubeCfg.Address), uint(kubeCfg.ReadOnlyPort), enableCAdvisorJSONEndpoints)
+		go k.ListenAndServeReadOnly(net.ParseIP(kubeCfg.Address), uint(kubeCfg.ReadOnlyPort))
 	}
 	if utilfeature.DefaultFeatureGate.Enabled(features.KubeletPodResources) {
 		go k.ListenAndServePodResources()
